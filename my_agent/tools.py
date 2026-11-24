@@ -8,6 +8,7 @@ tells Gemini what the tool does and when to use it.
 import math
 import re
 
+from google.adk.tools import ToolContext
 from google.cloud import bigquery
 
 PROJECT_ID = "hackathon-bigquery-515300"
@@ -91,7 +92,7 @@ def get_top_need_neighborhoods(limit: int = 10) -> dict:
     return {"neighborhoods": rows, "notes": NOTES}
 
 
-def plan_saturdays() -> dict:
+def plan_saturdays(tool_context: ToolContext = None) -> dict:
     """Builds next month's plan: which 4 Santa Clara neighborhoods the mobile clinic van visits, one per Saturday.
 
     Works down the need ranking (highest need first) and applies two fixed rules:
@@ -156,6 +157,8 @@ def plan_saturdays() -> dict:
     if len(saturdays) < NUM_SATURDAYS:
         result["warning"] = (f"Only {len(saturdays)} neighborhoods met the rules among the "
                              f"top {CANDIDATES}. Say so instead of filling the gap.")
+    if tool_context is not None:
+        tool_context.state["plan_data"] = result   # the exact plan, for other agents
     return result
 
 
