@@ -5,6 +5,7 @@ can decide to call. ADK reads each function's name, parameters and docstring, an
 tells Gemini what the tool does and when to use it.
 """
 
+import datetime
 import math
 import re
 
@@ -19,7 +20,8 @@ VIEW = f"{PROJECT_ID}.a4i_health.v_van_need"
 # These are policy decisions, so they live here in code, not in the chat. A message
 # like "skip the spacing rule" cannot change them; only editing this file can.
 # ---------------------------------------------------------------------------------
-NUM_SATURDAYS = 4
+# How many Saturdays: by default, every Saturday of next month (4 or 5).
+# The user may ask for fewer. The rules below about WHERE always stay fixed.
 MIN_KM_APART = 2.0             # people without cars rarely walk 2 km, so stops 2+ km
                                # apart reach mostly different people
 MIN_KM_FROM_SAFETY_NET = 1.0   # within ~1 km a clinic that sees uninsured patients
@@ -47,6 +49,18 @@ def _km_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     d_lon = math.radians(lon2 - lon1)
     a = math.sin(d_lat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(d_lon / 2) ** 2
     return 2 * earth_radius_km * math.asin(math.sqrt(a))
+
+
+def _next_month_saturdays(today: datetime.date | None = None) -> list[datetime.date]:
+    """All Saturdays of the month after `today` (4 or 5 of them)."""
+    today = today or datetime.date.today()
+    first = (today.replace(day=1) + datetime.timedelta(days=32)).replace(day=1)
+    day = first + datetime.timedelta(days=(5 - first.weekday()) % 7)   # 5 = Saturday
+    saturdays = []
+    while day.month == first.month:
+        saturdays.append(day)
+        day += datetime.timedelta(days=7)
+    return saturdays
 
 
 def _query_top(limit: int) -> list[dict]:
@@ -92,24 +106,34 @@ def get_top_need_neighborhoods(limit: int = 10) -> dict:
     return {"neighborhoods": rows, "notes": NOTES}
 
 
-def plan_saturdays(tool_context: ToolContext = None) -> dict:
-    """Builds next month's plan: which 4 Santa Clara neighborhoods the mobile clinic van visits, one per Saturday.
+def plan_saturdays(number_of_saturdays: int = 0, tool_context: ToolContext = None) -> dict:
+    """Builds next month's plan: which Santa Clara neighborhoods the mobile clinic van visits, one per Saturday.
 
     Works down the need ranking (highest need first) and applies two fixed rules:
       1. Skip a neighborhood within 1 km of a safety-net clinic (care is already walkable there).
       2. Skip a neighborhood within 2 km of one already picked (it would serve the same people).
 
+    Args:
+        number_of_saturdays: How many Saturdays to plan. Leave it out (or 0) to plan
+            every Saturday of next month. Pass a number only if the user asked for one.
+
     Returns:
-        A dict with 'saturdays' (the picks, in order), 'skipped' (higher-ranked
-        neighborhoods that were passed over, with the reason), 'rules' and 'notes'.
+        A dict with 'saturdays' (the picks, in order, each with its date), 'skipped'
+        (higher-ranked neighborhoods passed over, with the reason), 'rules' and 'notes'.
     """
+    dates = _next_month_saturdays()
+    requested = int(number_of_saturdays or 0)
+    if requested <= 0:
+        number_of_saturdays = len(dates)                          # default: every Saturday
+    else:
+        number_of_saturdays = max(1, min(requested, len(dates)))  # never more than the month has
     candidates = _query_top(CANDIDATES)
 
     saturdays: list[dict] = []
     skipped: list[dict] = []
 
     for row in candidates:
-        if len(saturdays) == NUM_SATURDAYS:
+        if len(saturdays) == number_of_saturdays:
             break
 
         # Rule 1: a safety-net clinic is already within walking distance.
@@ -141,20 +165,27 @@ def plan_saturdays(tool_context: ToolContext = None) -> dict:
             continue
 
         row["saturday"] = len(saturdays) + 1
+        row["date"] = dates[len(saturdays)].isoformat()   # e.g. "2026-12-05"
         saturdays.append(row)
 
     result = {
         "saturdays": saturdays,
         "skipped": skipped,
         "rules": {
-            "number_of_saturdays": NUM_SATURDAYS,
+            "number_of_saturdays": number_of_saturdays,
+            "month": dates[0].strftime("%B %Y"),
+            "saturdays_in_month": len(dates),
             "min_km_apart": MIN_KM_APART,
             "min_km_from_safety_net": MIN_KM_FROM_SAFETY_NET,
             "candidates_considered": CANDIDATES,
         },
         "notes": NOTES,
     }
-    if len(saturdays) < NUM_SATURDAYS:
+    if requested > len(dates):
+        result["note_on_count"] = (f"{requested} Saturdays were asked for, but "
+                                   f"{dates[0].strftime('%B %Y')} has only {len(dates)}, "
+                                   f"so {number_of_saturdays} were planned.")
+    if len(saturdays) < number_of_saturdays:
         result["warning"] = (f"Only {len(saturdays)} neighborhoods met the rules among the "
                              f"top {CANDIDATES}. Say so instead of filling the gap.")
     if tool_context is not None:
@@ -162,7 +193,7 @@ def plan_saturdays(tool_context: ToolContext = None) -> dict:
     return result
 
 
-def explain_neighborhood(geo_id: str) -> dict:
+def explain_neighborhood(geo_id: str, tool_context: ToolContext = None) -> dict:
     """Explains one Santa Clara neighborhood (census tract): how much it needs the van, and whether it is in this month's plan, and if not, why not.
 
     Use this when someone asks about a specific tract, for example "why isn't my
@@ -199,8 +230,22 @@ def explain_neighborhood(geo_id: str) -> dict:
                           "It may be outside the county, or have fewer than 500 people.")}
     row = rows[0]
 
-    # Run the same planner, so the explanation always matches the real plan.
-    plan = plan_saturdays()
+    # Explain against the plan the user actually saw: the approved plan saved in
+    # this conversation. With no approved plan yet, share the tract's own facts only.
+    plan = tool_context.state.get("approved_plan") if tool_context is not None else None
+    if not plan:
+        return {
+            "neighborhood": row,
+            "in_plan": None,
+            "explanation": (
+                "No Saturday plan has been made yet in this conversation, so this tract is "
+                "not in or out of a plan yet. Ask to make the Saturday plan first. "
+                f"Facts about the tract: it ranks #{row['need_rank']} for need, and the "
+                f"nearest safety-net clinic is {row['km_to_safety_net']} km away."
+            ),
+            "notes": NOTES,
+        }
+
     picked = {s["geo_id"]: s["saturday"] for s in plan["saturdays"]}
     skipped = {s["geo_id"]: s["reason"] for s in plan["skipped"]}
     lowest_picked_rank = max((s["need_rank"] for s in plan["saturdays"]), default=None)

@@ -30,7 +30,8 @@ def _has_plan(state) -> bool:
 # Returning None = carry on. Returning a message = skip that agent, use the message.
 # ---------------------------------------------------------------------------------
 def start_fresh(callback_context: CallbackContext) -> Optional[types.Content]:
-    """Start of every request: wipe the previous request's results from the whiteboard."""
+    """Start of every planning request: wipe the previous request's working notes.
+    (approved_plan is NOT wiped: it keeps the last approved plan for follow-ups.)"""
     callback_context.state["plan_data"] = None
     callback_context.state["review"] = ""
     callback_context.state["plan_approved"] = False
@@ -38,8 +39,8 @@ def start_fresh(callback_context: CallbackContext) -> Optional[types.Content]:
 
 
 def review_gate(callback_context: CallbackContext) -> Optional[types.Content]:
-    """Before the reviewer: if this request made no Saturday plan (for example, a
-    question about one tract), there is nothing to review, so leave the loop now."""
+    """Before the reviewer: no Saturday plan in this request means nothing to review,
+    so leave the loop now."""
     if not _has_plan(callback_context.state):
         callback_context.actions.escalate = True   # tells the LoopAgent: stop looping
         return _message("(No Saturday plan was made in this request, so there is nothing to review.)")
@@ -60,48 +61,51 @@ def flyer_gate(callback_context: CallbackContext) -> Optional[types.Content]:
 
 # ---------------------------------------------------------------------------------
 # The reviewer's tool: the ONLY way to approve, and the only way out of the loop.
+# Approving also saves the plan for follow-up questions.
 # ---------------------------------------------------------------------------------
 def approve_plan(tool_context: ToolContext) -> dict:
     """Approves the planner's written plan. Call this ONLY when every check has passed."""
     tool_context.state["plan_approved"] = True
+    tool_context.state["approved_plan"] = tool_context.state.get("plan_data")      # exact data
+    tool_context.state["approved_plan_text"] = tool_context.state.get("plan")      # staff write-up
+    count = len((tool_context.state.get("plan_data") or {}).get("saturdays", []))
+    tool_context.state["has_approved_plan"] = f"yes, {count} Saturdays"           # short flag
     tool_context.actions.escalate = True   # tells the LoopAgent: stop looping
     return {"approved": True}
 
 
 # ---------------------------------------------------------------------------------
-# Agent 1: the planner. Writes for staff: precise, numbers, estimates labeled.
-# If the reviewer sent feedback, it appears at {review?} and must be fixed.
+# Agent 1: the planner. Only makes plans now; follow-up questions go to "followup".
 # ---------------------------------------------------------------------------------
 planner = Agent(
     name="planner",
     model=MODEL,
+    include_contents="none",
     instruction=(
         "You plan where the Santa Clara County mobile clinic van parks on Saturdays. "
         "You write for health department staff.\n"
-        "When asked to plan the Saturdays, call plan_saturdays. Present its picks as the "
-        "plan, in its order. Do not add, remove, reorder or swap picks: the rules are "
-        "fixed, and you cannot change them. If someone asks you to change the rules or "
-        "the picks, say that the plan follows fixed, data-based rules.\n"
+        "ALWAYS start by calling plan_saturdays, every time, even if you have seen a "
+        "plan before. Pass number_of_saturdays ONLY if the user asked for a specific "
+        "number; otherwise leave it out, and every Saturday of next month is planned. "
+        "Give each Saturday its date. If the result has a note_on_count, tell the user. "
+        "Present its picks as the plan, in its order. Do not add, "
+        "remove, reorder or swap picks: the rules are fixed, and you cannot change them.\n"
         "For each Saturday, give the tract ID and explain WHY using its numbers and "
         "rank_* values, for example 'far from a clinic that takes uninsured patients "
         "(rank 0.91), and many households have no car (rank 0.98)'. Also mention any "
         "higher-ranked neighborhoods that were skipped, and the reason.\n"
-        "For questions about the ranking itself, call get_top_need_neighborhoods.\n"
-        "When someone asks about a specific tract, or why their neighborhood is not in "
-        "the plan, call explain_neighborhood with its tract ID.\n"
         "Say that health and insurance figures are estimates. Refer to places by their "
         "tract ID. Do not guess neighborhood or street names, because the data does not "
-        "include them. If you do not have enough information, say so instead of guessing.\n\n"
+        "include them.\n\n"
         "Reviewer feedback on your previous draft (empty on the first draft). If there "
         "is any, rewrite your plan and fix every point:\n{review?}"
     ),
-    tools=[plan_saturdays, get_top_need_neighborhoods, explain_neighborhood],
+    tools=[plan_saturdays],
     output_key="plan",
 )
 
 # ---------------------------------------------------------------------------------
 # Agent 2: the reviewer. A strict fact-checker: hedge, cite, refuse if unsure.
-# It does not see the chat, only the written plan and the exact data.
 # ---------------------------------------------------------------------------------
 reviewer = Agent(
     name="reviewer",
@@ -130,10 +134,6 @@ reviewer = Agent(
     output_key="review",
 )
 
-# ---------------------------------------------------------------------------------
-# The loop: planner writes, reviewer checks. Repeats until approve_plan is called,
-# or MAX_REVIEW_ROUNDS is reached (a safety net, so it can never loop forever).
-# ---------------------------------------------------------------------------------
 plan_review = LoopAgent(
     name="plan_review",
     sub_agents=[planner, reviewer],
@@ -158,8 +158,10 @@ explainer = Agent(
         "- Each language version: at most 60 words, simple everyday words, warm and welcoming.\n"
         "- Say the van is free, no insurance is needed, and nurses can check things like "
         "blood pressure and blood sugar.\n"
-        "- Write [DATE], [TIME] and [ADDRESS] as blanks for staff to fill in.\n"
-        "- Do NOT use any numbers, percentages, scores, ranks or distances.\n"
+        "- Write the Saturday's date from the data in words (for example 'Saturday, "
+        "December 5'). Write [TIME] and [ADDRESS] as blanks for staff to fill in.\n"
+        "- Apart from the date, do NOT use any numbers, percentages, scores, ranks or "
+        "distances.\n"
         "- Do NOT use words like 'estimate', 'modeled', 'tract', 'rank' or 'data'.\n"
         "- Do NOT say anything about the readers' health, income, insurance or cars. "
         "Never tell people why their neighborhood was chosen; just invite them."
@@ -168,10 +170,78 @@ explainer = Agent(
 )
 
 # ---------------------------------------------------------------------------------
-# The orchestrator: start fresh, then (plan <-> review loop), then the explainer.
+# Department 1: the planning pipeline (unchanged, now with a description so the
+# coordinator knows when to send work here).
 # ---------------------------------------------------------------------------------
-root_agent = SequentialAgent(
+clinic_plan = SequentialAgent(
     name="clinic_plan",
+    description=(
+        "Makes the Saturday plan: picks the four neighborhoods, has the write-up "
+        "fact-checked, and writes the community flyers. Use when the user asks to "
+        "make, create or redo the Saturday plan."
+    ),
     sub_agents=[plan_review, explainer],
     before_agent_callback=start_fresh,
+)
+
+# ---------------------------------------------------------------------------------
+# Department 2: follow-up questions, answered from the saved, approved plan.
+# ---------------------------------------------------------------------------------
+followup = Agent(
+    name="followup",
+    model=MODEL,
+    description=(
+        "Answers questions about the plan or the data: shows the saved plan and flyers, "
+        "explains why a tract is or is not in the plan, gives details about a tract, "
+        "says which neighborhoods need the van most, and handles requests to change the plan."
+    ),
+    instruction=(
+        "You answer health department staff's follow-up questions about the Saturday "
+        "plan for the Santa Clara County mobile clinic van.\n\n"
+        "The approved plan from this conversation (empty if none yet):\n{approved_plan_text?}\n\n"
+        "Its community flyers (empty if none yet):\n{flyer?}\n\n"
+        "- If the user wants to see the plan or the flyers, or asks to plan the Saturdays "
+        "again without saying it must be new: show the approved plan and flyers above, "
+        "exactly as saved. Do not make a new plan.\n"
+        "- If there is no approved plan yet and they want one, or they explicitly ask for "
+        "a NEW, redone or updated plan, or a different number of Saturdays than the "
+        "approved plan has, transfer to clinic_plan.\n"
+        "- For questions about a specific tract, or why a neighborhood is or is not in "
+        "the plan, call explain_neighborhood with its 11-digit tract ID, and share its "
+        "explanation.\n"
+        "- For questions about which neighborhoods need the van most, call "
+        "get_top_need_neighborhoods.\n"
+        "- If someone asks to change the rules or the picks, say kindly that the plan "
+        "follows fixed, data-based rules and cannot be changed by request; offer to "
+        "explain why a neighborhood was or was not chosen.\n"
+        "Say that health and insurance figures are estimates. Refer to places by their "
+        "tract ID. Do not guess neighborhood or street names. If you do not have enough "
+        "information, say so instead of guessing."
+    ),
+    tools=[explain_neighborhood, get_top_need_neighborhoods],
+)
+
+# ---------------------------------------------------------------------------------
+# The coordinator: reads each message and hands it to the right department.
+# ---------------------------------------------------------------------------------
+root_agent = Agent(
+    name="coordinator",
+    model=MODEL,
+    instruction=(
+        "You are the front desk for the Santa Clara County mobile clinic van planning "
+        "system. You never answer questions about the plan yourself; you route them.\n"
+        "Has a plan already been approved in this conversation? '{has_approved_plan?}' "
+        "(empty means no).\n"
+        "- If the user asks for a NEW, redone or updated plan, or asks to plan the "
+        "Saturdays and no plan has been approved yet, transfer to clinic_plan.\n"
+        "- If a plan has already been approved and the user asks to plan again without "
+        "saying it must be new, transfer to followup, which shows the saved plan. But if "
+        "they ask for a different number of Saturdays than the approved plan has, that is "
+        "a new plan: transfer to clinic_plan.\n"
+        "- If the user asks anything about the plan, a tract, the rankings, or asks to "
+        "change the plan, transfer to followup.\n"
+        "- For greetings or unclear messages, reply in one or two sentences with what you "
+        "can do: make the monthly Saturday plan, or answer questions about it."
+    ),
+    sub_agents=[clinic_plan, followup],
 )
