@@ -5,7 +5,7 @@ from google.adk.agents.callback_context import CallbackContext
 from google.adk.tools import ToolContext
 from google.genai import types
 
-from .tools import explain_neighborhood, get_top_need_neighborhoods, plan_saturdays
+from .tools import audit_plan, explain_neighborhood, get_top_need_neighborhoods, plan_saturdays
 
 MODEL = "gemini-flash-lite-latest"
 MAX_REVIEW_ROUNDS = 3
@@ -176,6 +176,43 @@ explainer = Agent(
 )
 
 # ---------------------------------------------------------------------------------
+# Agent 4: the auditor. Runs after every approved plan. The ONLY agent with race and
+# income data. It reports who the plan reaches and can NEVER change the plan.
+# ---------------------------------------------------------------------------------
+def audit_gate(callback_context: CallbackContext) -> Optional[types.Content]:
+    """Before the auditor: audit only a plan approved in THIS request."""
+    if not callback_context.state.get("plan_approved"):
+        return _message("(No audit: no plan was approved in this request.)")
+    return None
+
+
+auditor = Agent(
+    name="auditor",
+    model=MODEL,
+    include_contents="none",
+    before_agent_callback=audit_gate,
+    instruction=(
+        "You are the equity auditor for the Santa Clara County mobile clinic van plan. "
+        "You write for health department staff.\n"
+        "Call audit_plan, then report in plain words who the approved plan reaches compared "
+        "with the whole county: each group's share in the plan and in the county, poverty, "
+        "and typical income. Point out the biggest differences, in both directions.\n"
+        "Rules:\n"
+        "- Race and income were never inputs to the plan. Say so: this audit only describes "
+        "who the plan reaches.\n"
+        "- Never recommend adding, removing or swapping neighborhoods, and never suggest "
+        "choosing places by race. If a difference looks worrying, say that people may want "
+        "to review the planning method openly.\n"
+        "- Do not state causes as facts. You may say a difference 'may reflect' something.\n"
+        "- Include every caveat from the tool result, briefly.\n"
+        "- If the tool returns an error, report it plainly and stop."
+    ),
+    tools=[audit_plan],
+    output_key="audit_report",
+)
+
+
+# ---------------------------------------------------------------------------------
 # Department 1: the planning pipeline (unchanged, now with a description so the
 # coordinator knows when to send work here).
 # ---------------------------------------------------------------------------------
@@ -186,7 +223,7 @@ clinic_plan = SequentialAgent(
         "fact-checked, and writes the community flyers. Use when the user asks to "
         "make, create or redo the Saturday plan."
     ),
-    sub_agents=[plan_review, explainer],
+    sub_agents=[plan_review, auditor, explainer],
     before_agent_callback=start_fresh,
 )
 
@@ -206,6 +243,7 @@ followup = Agent(
         "plan for the Santa Clara County mobile clinic van.\n\n"
         "The approved plan from this conversation (empty if none yet):\n{approved_plan_text?}\n\n"
         "Its community flyers (empty if none yet):\n{flyer?}\n\n"
+        "Its equity audit (empty if none yet):\n{audit_report?}\n\n"
         "- If the user wants to see the plan or the flyers, or asks to plan the Saturdays "
         "again without saying it must be new: show the approved plan and flyers above, "
         "exactly as saved. Do not make a new plan.\n"
@@ -218,6 +256,7 @@ followup = Agent(
         "- For questions about which neighborhoods need the van most, call "
         "get_top_need_neighborhoods.\n"
         "- If the user asks to change the wording of the flyers, transfer to flyer_editor.\n"
+        "- If the user asks about the equity audit, show the audit above exactly as saved.\n"
         "- If someone asks to change the rules or the picks, say kindly that the plan "
         "follows fixed, data-based rules and cannot be changed by request; offer to "
         "explain why a neighborhood was or was not chosen.\n"

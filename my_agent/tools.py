@@ -268,3 +268,95 @@ def explain_neighborhood(geo_id: str, tool_context: ToolContext = None) -> dict:
                        f"higher-need neighborhoods (ranked #{lowest_picked_rank} or higher).")
 
     return {"neighborhood": row, "in_plan": in_plan, "explanation": explanation, "notes": NOTES}
+
+
+
+# ---------------------------------------------------------------------------------
+# The audit. This is the ONLY place in the project that reads race and income data,
+# and only the auditor agent gets this tool. Nothing here can change the plan.
+# ---------------------------------------------------------------------------------
+ACS_TABLE = "bigquery-public-data.census_bureau_acs.censustract_2020_5yr"
+
+
+def audit_plan(tool_context: ToolContext) -> dict:
+    """Audits the approved plan: compares who lives in its neighborhoods with the whole county.
+
+    Reports Hispanic, Black, white and Asian shares, approximate poverty and typical
+    neighborhood income, for the plan and for the county. For AUDITING ONLY: these
+    numbers must never be used to choose, add, remove or swap neighborhoods.
+
+    Returns:
+        A dict with 'plan', 'county', 'plan_vs_county' (plan share / county share),
+        'checks' and 'caveats'.
+    """
+    plan = tool_context.state.get("approved_plan")
+    if not plan or not plan.get("saturdays"):
+        return {"error": "There is no approved plan to audit."}
+    ids = [s["geo_id"] for s in plan["saturdays"]]
+    county = ids[0][:5]                       # e.g. "06085" = Santa Clara
+
+    client = bigquery.Client(project=PROJECT_ID)
+    # The Census table stores IDs WITHOUT the leading zero (6085... instead of
+    # 06085...), so LPAD adds it back. Without this, nothing would match.
+    query = f"""
+        WITH acs AS (
+          SELECT LPAD(geo_id, 11, '0') AS geo_id,
+                 total_pop, hispanic_pop, black_pop, white_pop, asian_pop,
+                 poverty, median_income
+          FROM `{ACS_TABLE}`
+          WHERE STARTS_WITH(LPAD(geo_id, 11, '0'), @county)
+        ),
+        areas AS (
+          SELECT 'plan' AS area, * FROM acs WHERE geo_id IN UNNEST(@ids)
+          UNION ALL
+          SELECT 'county' AS area, * FROM acs
+        )
+        SELECT
+          area,
+          COUNT(*)                                                      AS tracts,
+          CAST(SUM(total_pop) AS INT64)                                 AS people,
+          ROUND(100 * SAFE_DIVIDE(SUM(hispanic_pop), SUM(total_pop)), 1) AS pct_hispanic,
+          ROUND(100 * SAFE_DIVIDE(SUM(black_pop),    SUM(total_pop)), 1) AS pct_black,
+          ROUND(100 * SAFE_DIVIDE(SUM(white_pop),    SUM(total_pop)), 1) AS pct_white,
+          ROUND(100 * SAFE_DIVIDE(SUM(asian_pop),    SUM(total_pop)), 1) AS pct_asian,
+          ROUND(100 * SAFE_DIVIDE(SUM(hispanic_pop) + SUM(black_pop) + SUM(white_pop)
+                                  + SUM(asian_pop), SUM(total_pop)), 1)  AS pct_four_groups_total,
+          ROUND(100 * SAFE_DIVIDE(SUM(poverty), SUM(total_pop)), 1)      AS pct_poverty_approx,
+          CAST(APPROX_QUANTILES(median_income, 2)[OFFSET(1)] AS INT64)   AS typical_tract_income
+        FROM areas
+        GROUP BY area
+    """
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("county", "STRING", county),
+        bigquery.ArrayQueryParameter("ids", "STRING", ids),
+    ])
+    rows = {r["area"]: dict(r.items()) for r in client.query(query, job_config=job_config).result()}
+    plan_row, county_row = rows.get("plan"), rows.get("county")
+    if not plan_row or not county_row:
+        return {"error": "The Census data did not match the plan's tracts, so no audit was possible."}
+
+    ratios = {}
+    for key in ("pct_hispanic", "pct_black", "pct_white", "pct_asian",
+                "pct_poverty_approx", "typical_tract_income"):
+        if plan_row.get(key) is not None and county_row.get(key):
+            ratios[key] = round(plan_row[key] / county_row[key], 2)
+
+    result = {
+        "plan": plan_row,
+        "county": county_row,
+        "plan_vs_county": ratios,
+        "checks": {
+            "plan_tracts_found_in_census": f"{plan_row['tracts']} of {len(ids)}",
+            "groups_overlap_check": "pct_four_groups_total near 100 means the four groups barely overlap",
+        },
+        "caveats": [
+            f"Only {len(ids)} neighborhoods: small samples swing a lot.",
+            "Census ACS figures are 5-year survey estimates with margins of error.",
+            "Poverty is approximate: people below poverty divided by total population.",
+            f"typical_tract_income is the middle of only {len(ids)} neighborhood medians.",
+            "Broad groups such as 'Asian' combine very different communities.",
+            "Race and income were never inputs to the plan; this only describes who it reaches.",
+        ],
+    }
+    tool_context.state["audit_data"] = result
+    return result
