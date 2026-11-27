@@ -247,15 +247,13 @@ followup = Agent(
         "- If the user wants to see the plan or the flyers, or asks to plan the Saturdays "
         "again without saying it must be new: show the approved plan and flyers above, "
         "exactly as saved. Do not make a new plan.\n"
-        "- If there is no approved plan yet and they want one, or they explicitly ask for "
-        "a NEW, redone or updated plan, or a different number of Saturdays than the "
-        "approved plan has, transfer to clinic_plan.\n"
+        "- You never make plans. If there is no approved plan yet, say so, and that they "
+        "can ask to make the Saturday plan.\n"
         "- For questions about a specific tract, or why a neighborhood is or is not in "
         "the plan, call explain_neighborhood with its 11-digit tract ID, and share its "
         "explanation.\n"
         "- For questions about which neighborhoods need the van most, call "
         "get_top_need_neighborhoods.\n"
-        "- If the user asks to change the wording of the flyers, transfer to flyer_editor.\n"
         "- If the user asks about the equity audit, show the audit above exactly as saved.\n"
         "- If someone asks to change the rules or the picks, say kindly that the plan "
         "follows fixed, data-based rules and cannot be changed by request; offer to "
@@ -265,6 +263,10 @@ followup = Agent(
         "information, say so instead of guessing."
     ),
     tools=[explain_neighborhood, get_top_need_neighborhoods],
+    # Followup never routes. Every new message goes back to the coordinator, who
+    # decides. (The evals caught followup sending "plan again" to the planners.)
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
 )
 
 # ---------------------------------------------------------------------------------
@@ -300,6 +302,7 @@ flyer_editor = Agent(
     # After each edit, the NEXT message goes back to the coordinator, instead of
     # staying "stuck" with the editor (who only handles flyer wording).
     disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
     instruction=(
         "You revise the community flyers for the Santa Clara County mobile clinic van, "
         "at the request of health department staff.\n\n"
@@ -312,8 +315,8 @@ flyer_editor = Agent(
         "do not make that part: explain kindly which rule it breaks, and make the rest.\n"
         "When the revised flyers are ready, call save_flyers with the COMPLETE text of all "
         "of them. Then show the revised flyers to the user, and list any part you did not do.\n"
-        "You only edit wording. For anything else (a new plan, questions about the plan or "
-        "a tract), transfer to clinic_plan or followup."
+        "You only edit wording. If the user asks for anything else, say that you only edit "
+        "the flyers, and that they can simply ask again: the front desk will route it."
     ),
     tools=[save_flyers],
 )
@@ -336,6 +339,9 @@ root_agent = Agent(
         "saying it must be new, transfer to followup, which shows the saved plan. But if "
         "they ask for a different number of Saturdays than the approved plan has, that is "
         "a new plan: transfer to clinic_plan.\n"
+        "  Examples that go to followup when a plan is approved: 'plan the Saturdays again', "
+        "'plan again', 'what is the plan', 'show the schedule'. Only words like new, redo, "
+        "update, refresh or start over, or a different number of Saturdays, go to clinic_plan.\n"
         "- If the user asks anything about the plan, a tract, the rankings, or asks to "
         "change the plan, transfer to followup.\n"
         "- If the user asks to change the wording of the flyers, transfer to flyer_editor.\n"
