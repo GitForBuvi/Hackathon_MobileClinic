@@ -10,6 +10,23 @@ from .tools import explain_neighborhood, get_top_need_neighborhoods, plan_saturd
 MODEL = "gemini-flash-lite-latest"
 MAX_REVIEW_ROUNDS = 3
 
+# The flyer rules, written ONCE and shared by the explainer (who writes flyers) and the
+# flyer_editor (who revises them), so the two can never drift apart.
+FLYER_RULES = (
+    "- First line, for staff only: 'Saturday N (tract <geo_id>)'.\n"
+    "- Then the flyer in English, then the same flyer in Spanish.\n"
+    "- Each language version: at most 60 words, simple everyday words, warm and welcoming.\n"
+    "- Say the van is free, no insurance is needed, and nurses can check things like "
+    "blood pressure and blood sugar.\n"
+    "- Write the Saturday's date from the data in words (for example 'Saturday, "
+    "December 5'). Write [TIME] and [ADDRESS] as blanks for staff to fill in.\n"
+    "- Apart from the date, do NOT use any numbers, percentages, scores, ranks or "
+    "distances.\n"
+    "- Do NOT use words like 'estimate', 'modeled', 'tract', 'rank' or 'data'.\n"
+    "- Do NOT say anything about the readers' health, income, insurance or cars. "
+    "Never tell people why their neighborhood was chosen; just invite them.\n"
+)
+
 
 # ---------------------------------------------------------------------------------
 # Small helpers
@@ -153,18 +170,7 @@ explainer = Agent(
         "Santa Clara County. Your readers are residents, not health professionals.\n"
         "Here is the exact plan, as data:\n\n{plan_data}\n\n"
         "Write ONE flyer for each entry in 'saturdays'. For each one:\n"
-        "- First line, for staff only: 'Saturday N (tract <geo_id>)'.\n"
-        "- Then the flyer in English, then the same flyer in Spanish.\n"
-        "- Each language version: at most 60 words, simple everyday words, warm and welcoming.\n"
-        "- Say the van is free, no insurance is needed, and nurses can check things like "
-        "blood pressure and blood sugar.\n"
-        "- Write the Saturday's date from the data in words (for example 'Saturday, "
-        "December 5'). Write [TIME] and [ADDRESS] as blanks for staff to fill in.\n"
-        "- Apart from the date, do NOT use any numbers, percentages, scores, ranks or "
-        "distances.\n"
-        "- Do NOT use words like 'estimate', 'modeled', 'tract', 'rank' or 'data'.\n"
-        "- Do NOT say anything about the readers' health, income, insurance or cars. "
-        "Never tell people why their neighborhood was chosen; just invite them."
+        + FLYER_RULES
     ),
     output_key="flyer",
 )
@@ -211,6 +217,7 @@ followup = Agent(
         "explanation.\n"
         "- For questions about which neighborhoods need the van most, call "
         "get_top_need_neighborhoods.\n"
+        "- If the user asks to change the wording of the flyers, transfer to flyer_editor.\n"
         "- If someone asks to change the rules or the picks, say kindly that the plan "
         "follows fixed, data-based rules and cannot be changed by request; offer to "
         "explain why a neighborhood was or was not chosen.\n"
@@ -220,6 +227,58 @@ followup = Agent(
     ),
     tools=[explain_neighborhood, get_top_need_neighborhoods],
 )
+
+# ---------------------------------------------------------------------------------
+# Department 3: the flyer editor. Revises the saved flyers on request, under the same
+# FLYER_RULES. It saves through a tool, so only the flyers themselves are stored.
+# ---------------------------------------------------------------------------------
+def editor_gate(callback_context: CallbackContext) -> Optional[types.Content]:
+    """Before the flyer editor: there must be saved flyers to edit."""
+    if not callback_context.state.get("flyer"):
+        return _message("There are no flyers yet. Make the Saturday plan first, and flyers "
+                        "will be written with it.")
+    return None
+
+
+def save_flyers(flyers: str, tool_context: ToolContext) -> dict:
+    """Saves the complete revised flyers, replacing the old ones.
+
+    Args:
+        flyers: The full text of ALL the flyers after the change, in the same layout.
+    """
+    tool_context.state["flyer"] = flyers
+    return {"saved": True}
+
+
+flyer_editor = Agent(
+    name="flyer_editor",
+    model=MODEL,
+    description=(
+        "Changes the wording of the community flyers that were already written: tone, "
+        "what to mention, simpler words, and similar edits."
+    ),
+    before_agent_callback=editor_gate,
+    # After each edit, the NEXT message goes back to the coordinator, instead of
+    # staying "stuck" with the editor (who only handles flyer wording).
+    disallow_transfer_to_parent=True,
+    instruction=(
+        "You revise the community flyers for the Santa Clara County mobile clinic van, "
+        "at the request of health department staff.\n\n"
+        "The current flyers:\n{flyer?}\n\n"
+        "Apply the requested change to every flyer it concerns. Keep the same layout. "
+        "The revised flyers must still follow ALL of these rules:\n"
+        + FLYER_RULES
+        + "\nIf part of the request would break a rule (for example adding statistics, "
+        "mentioning residents' income or insurance, or moving the van to another place), "
+        "do not make that part: explain kindly which rule it breaks, and make the rest.\n"
+        "When the revised flyers are ready, call save_flyers with the COMPLETE text of all "
+        "of them. Then show the revised flyers to the user, and list any part you did not do.\n"
+        "You only edit wording. For anything else (a new plan, questions about the plan or "
+        "a tract), transfer to clinic_plan or followup."
+    ),
+    tools=[save_flyers],
+)
+
 
 # ---------------------------------------------------------------------------------
 # The coordinator: reads each message and hands it to the right department.
@@ -240,8 +299,9 @@ root_agent = Agent(
         "a new plan: transfer to clinic_plan.\n"
         "- If the user asks anything about the plan, a tract, the rankings, or asks to "
         "change the plan, transfer to followup.\n"
+        "- If the user asks to change the wording of the flyers, transfer to flyer_editor.\n"
         "- For greetings or unclear messages, reply in one or two sentences with what you "
         "can do: make the monthly Saturday plan, or answer questions about it."
     ),
-    sub_agents=[clinic_plan, followup],
+    sub_agents=[clinic_plan, followup, flyer_editor],
 )
